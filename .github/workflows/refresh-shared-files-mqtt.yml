@@ -1,0 +1,35 @@
+name: Refresh Shared Files MQTT
+
+on:
+  schedule:
+    # 6時間ごと
+    - cron: "0 */6 * * *"
+
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install paho-mqtt psycopg[binary]
+
+      - name: Refresh MQTT Retain
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          MQTT_HOST: broker.hivemq.com
+          MQTT_PORT: "8883"
+          MQTT_USERNAME: ${{ secrets.MQTT_USERNAME }}
+          MQTT_PASSWORD: ${{ secrets.MQTT_PASSWORD }}
+        run: |
+          python refresh_shared_files_mqtt.py

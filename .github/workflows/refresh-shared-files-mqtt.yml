@@ -2,7 +2,6 @@ name: Refresh Shared Files MQTT
 
 on:
   schedule:
-    # 6時間ごと
     - cron: "0 */6 * * *"
 
   workflow_dispatch:
@@ -10,6 +9,8 @@ on:
 jobs:
   refresh:
     runs-on: ubuntu-latest
+
+    timeout-minutes: 360
 
     steps:
       - name: Checkout
@@ -22,9 +23,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install paho-mqtt psycopg[binary]
+          python -m pip install --upgrade pip
+          pip install "psycopg[binary]" paho-mqtt
 
-      - name: Refresh MQTT Retain
+      - name: Rebuild MQTT files
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           MQTT_HOST: broker.hivemq.com

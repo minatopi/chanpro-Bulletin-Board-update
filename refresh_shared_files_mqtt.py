@@ -2,8 +2,9 @@ import os
 import sys
 import time
 import ssl
+import uuid
 import threading
-from datetime import datetime, timezone
+import json
 
 import psycopg
 import paho.mqtt.client as mqtt
@@ -16,7 +17,7 @@ import paho.mqtt.client as mqtt
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 if not DATABASE_URL:
-    print("ERROR: DATABASE_URL が設定されていません。")
+    print("ERROR: DATABASE_URL が設定されていません")
     sys.exit(1)
 
 
@@ -44,30 +45,23 @@ MQTT_PASSWORD = os.environ.get(
 
 
 MQTT_BASE = "chanpro-share-v2"
-
-MQTT_FILE_BASE = (
-    MQTT_BASE + "/file"
-)
+MQTT_FILE_BASE = MQTT_BASE + "/file"
 
 
 # ============================================================
-# 待ち時間設定
+# 待ち時間
 # ============================================================
 
 # MQTT接続待ち
 MQTT_CONNECT_TIMEOUT = 60
 
-# MQTT Publish完了待ち
-#
-# ここを10分に設定
-#
-# 大容量ファイルや大量チャンクでも
-# かなり余裕を持って待つ
-#
+
+# Publish完了待ち
+# 1回につき最大10分
 MQTT_PUBLISH_TIMEOUT = 600
 
 
-# Publishリトライ回数
+# Publishリトライ
 PUBLISH_RETRY_COUNT = 5
 
 
@@ -75,16 +69,12 @@ PUBLISH_RETRY_COUNT = 5
 PUBLISH_RETRY_DELAY = 5
 
 
-# Retainデータ取得待ち
+# 元データの読み込み待ち
 RETAIN_RECEIVE_TIMEOUT = 300
 
 
-# データ受信後の安定待ち
+# 全チャンク取得後の安定待ち
 RETAIN_SETTLE_TIME = 3
-
-
-# MQTT再接続待ち
-MQTT_RECONNECT_DELAY = 10
 
 
 # 最大ファイル数
@@ -92,21 +82,16 @@ MAX_FILES = 100
 
 
 # ============================================================
-# MQTTデータ格納
+# MQTT状態
 # ============================================================
+
+mqtt_client = None
+
+connected_event = threading.Event()
 
 received_messages = {}
 
 received_lock = threading.Lock()
-
-connected_event = threading.Event()
-
-
-# ============================================================
-# MQTT Client
-# ============================================================
-
-mqtt_client = None
 
 
 # ============================================================
@@ -120,16 +105,19 @@ def on_connect(
     rc,
     properties=None
 ):
+
     if rc == 0:
+
         print(
-            "[MQTT] Connected successfully"
+            "[MQTT] Connected"
         )
 
         connected_event.set()
 
     else:
+
         print(
-            f"[MQTT] Connect failed rc={rc}"
+            f"[MQTT] Connect failed: rc={rc}"
         )
 
 
@@ -143,10 +131,11 @@ def on_disconnect(
     rc,
     properties=None
 ):
+
     connected_event.clear()
 
     print(
-        f"[MQTT] Disconnected rc={rc}"
+        f"[MQTT] Disconnected: rc={rc}"
     )
 
 
@@ -159,31 +148,34 @@ def on_message(
     userdata,
     msg
 ):
-    topic = msg.topic
 
+    topic = msg.topic
     payload = bytes(msg.payload)
 
     with received_lock:
+
         received_messages[topic] = payload
 
     print(
-        f"[MQTT] Received retained: "
-        f"{topic} "
+        "[MQTT] received:",
+        topic,
         f"({len(payload):,} bytes)"
     )
 
 
 # ============================================================
-# MQTT初期化
+# MQTT Client作成
 # ============================================================
 
 def create_mqtt_client():
 
     client = mqtt.Client(
-        callback_api_version=mqtt.CallbackAPIVersion.VERSION1,
+        callback_api_version=
+            mqtt.CallbackAPIVersion.VERSION1,
+
         client_id=(
-            "chanpro-github-refresh-"
-            + str(int(time.time()))
+            "chanpro-share-rebuild-"
+            + str(uuid.uuid4())
         )
     )
 
@@ -191,15 +183,14 @@ def create_mqtt_client():
     client.on_disconnect = on_disconnect
     client.on_message = on_message
 
-    # TLS
     client.tls_set(
         cert_reqs=ssl.CERT_REQUIRED
     )
 
     client.tls_insecure_set(False)
 
-    # 認証情報
     if MQTT_USERNAME:
+
         client.username_pw_set(
             MQTT_USERNAME,
             MQTT_PASSWORD
@@ -231,17 +222,25 @@ def connect_mqtt():
 
     mqtt_client.loop_start()
 
-    start = time.time()
+    start_time = time.time()
 
     while True:
 
         if connected_event.is_set():
-            print("[MQTT] Connection ready")
+
+            print(
+                "[MQTT] Connection ready"
+            )
+
             return
 
-        if time.time() - start >= MQTT_CONNECT_TIMEOUT:
+        if (
+            time.time() - start_time
+            >= MQTT_CONNECT_TIMEOUT
+        ):
+
             raise TimeoutError(
-                "MQTT接続がタイムアウトしました"
+                "MQTT接続タイムアウト"
             )
 
         time.sleep(0.2)
@@ -253,39 +252,39 @@ def connect_mqtt():
 
 def ensure_mqtt_connection():
 
-    if mqtt_client is None:
-        connect_mqtt()
-        return
+    if (
+        mqtt_client is not None
+        and connected_event.is_set()
+    ):
 
-    if connected_event.is_set():
         return
 
     print(
-        "[MQTT] 再接続を開始します..."
-    )
-
-    time.sleep(
-        MQTT_RECONNECT_DELAY
+        "[MQTT] 再接続します"
     )
 
     try:
+
         mqtt_client.reconnect()
 
     except Exception as e:
+
         print(
-            f"[MQTT] reconnect error: {e}"
+            "[MQTT] reconnect error:",
+            e
         )
 
-    start = time.time()
+    start_time = time.time()
 
     while not connected_event.is_set():
 
         if (
-            time.time() - start
+            time.time() - start_time
             >= MQTT_CONNECT_TIMEOUT
         ):
+
             raise TimeoutError(
-                "MQTT再接続がタイムアウトしました"
+                "MQTT再接続タイムアウト"
             )
 
         time.sleep(0.5)
@@ -311,9 +310,11 @@ def publish_with_retry(
 
         print(
             f"[MQTT] Publish "
-            f"{attempt}/{PUBLISH_RETRY_COUNT}: "
-            f"{topic} "
-            f"({len(payload):,} bytes)"
+            f"{attempt}/{PUBLISH_RETRY_COUNT}"
+        )
+
+        print(
+            f"        {topic}"
         )
 
         try:
@@ -327,27 +328,24 @@ def publish_with_retry(
                 retain=retain
             )
 
-            # ------------------------------------------------
+            # =================================================
             # Publish完了待ち
-            #
             # 最大10分
-            # ------------------------------------------------
+            # =================================================
 
             info.wait_for_publish(
                 timeout=MQTT_PUBLISH_TIMEOUT
             )
 
-            # 完了確認
             if not info.is_published():
 
                 raise TimeoutError(
-                    "MQTT Publish完了待ちが"
-                    "タイムアウトしました"
+                    "MQTT Publish完了待ち"
+                    "タイムアウト"
                 )
 
             print(
-                f"[MQTT] Publish completed: "
-                f"{topic}"
+                "[MQTT] Publish completed"
             )
 
             return True
@@ -357,52 +355,35 @@ def publish_with_retry(
             last_error = e
 
             print(
-                f"[MQTT] Publish failed: "
-                f"{topic}"
+                "[MQTT] Publish failed:",
+                e
             )
 
-            print(
-                f"        {e}"
-            )
-
-            if attempt < PUBLISH_RETRY_COUNT:
+            if (
+                attempt
+                < PUBLISH_RETRY_COUNT
+            ):
 
                 print(
-                    f"[MQTT] "
                     f"{PUBLISH_RETRY_DELAY}秒後に"
-                    f"リトライします"
+                    "リトライします"
                 )
 
                 time.sleep(
                     PUBLISH_RETRY_DELAY
                 )
 
-                try:
-                    ensure_mqtt_connection()
-
-                except Exception as reconnect_error:
-
-                    print(
-                        "[MQTT] "
-                        "再接続エラー: "
-                        f"{reconnect_error}"
-                    )
-
     raise RuntimeError(
-        f"MQTT Publish failed: "
-        f"{topic}: {last_error}"
+        f"Publish failed: {topic}: "
+        f"{last_error}"
     )
 
 
 # ============================================================
-# Supabase / PostgreSQL
+# DBからファイル一覧取得
 # ============================================================
 
 def get_shared_files():
-
-    print(
-        "[DB] shared_files を取得しています..."
-    )
 
     sql = """
         SELECT
@@ -416,7 +397,7 @@ def get_shared_files():
             mqtt_topic,
             created_at
         FROM public.shared_files
-        ORDER BY created_at DESC
+        ORDER BY created_at ASC
         LIMIT %s
     """
 
@@ -438,71 +419,90 @@ def get_shared_files():
     for row in rows:
 
         files.append({
-            "id": row[0],
-            "user_id": row[1],
-            "file_name": row[2],
-            "file_size": row[3],
-            "mime_type": row[4],
-            "chunk_count": row[5],
-            "chunk_size": row[6],
-            "mqtt_topic": row[7],
-            "created_at": row[8],
-        })
 
-    print(
-        f"[DB] {len(files)}件取得しました"
-    )
+            "id": row[0],
+
+            "user_id": row[1],
+
+            "file_name": row[2],
+
+            "file_size": row[3],
+
+            "mime_type": row[4],
+
+            "chunk_count": row[5],
+
+            "chunk_size": row[6],
+
+            "mqtt_topic": row[7],
+
+            "created_at": row[8]
+        })
 
     return files
 
 
 # ============================================================
-# MQTT Retain受信
+# 元MQTTデータ読み込み
 # ============================================================
 
-def receive_retained_file(file_info):
+def read_old_mqtt_data(
+    file_info
+):
 
-    topic = file_info["mqtt_topic"]
+    old_topic = file_info["mqtt_topic"]
 
     chunk_count = int(
         file_info["chunk_count"]
     )
 
     print("")
-    print("=" * 70)
     print(
-        f"[RECEIVE] {file_info['file_name']}"
+        "=" * 70
     )
+
     print(
-        f"[RECEIVE] chunks={chunk_count}"
+        "[READ OLD]"
     )
+
     print(
-        f"[RECEIVE] topic={topic}"
+        "file:",
+        file_info["file_name"]
     )
-    print("=" * 70)
+
+    print(
+        "old topic:",
+        old_topic
+    )
+
+    print(
+        "chunks:",
+        chunk_count
+    )
+
+    print(
+        "=" * 70
+    )
 
     with received_lock:
+
         received_messages.clear()
 
     ensure_mqtt_connection()
 
     chunk_topic = (
-        topic.rstrip("/")
+        old_topic
         + "/chunk/+"
     )
 
     meta_topic = (
-        topic.rstrip("/")
+        old_topic
         + "/meta"
     )
 
     # --------------------------------------------------------
-    # 一度だけsubscribe
+    # subscribe
     # --------------------------------------------------------
-
-    print(
-        f"[MQTT] Subscribe: {chunk_topic}"
-    )
 
     mqtt_client.subscribe(
         chunk_topic,
@@ -516,85 +516,79 @@ def receive_retained_file(file_info):
 
     expected_chunks = set()
 
-    for index in range(chunk_count):
+    for index in range(
+        chunk_count
+    ):
 
         expected_chunks.add(
-            f"{topic}/chunk/{index:06d}"
+            f"{old_topic}/chunk/"
+            f"{index:06d}"
         )
 
-    expected_meta = meta_topic
+    start_time = time.time()
 
-    start = time.time()
-
-    last_count = 0
-    last_change = time.time()
+    last_count = -1
 
     while True:
 
         with received_lock:
-            current_topics = set(
+
+            current = set(
                 received_messages.keys()
             )
 
-        received_chunk_topics = (
-            current_topics
+        received_chunks = (
+            current
             & expected_chunks
         )
 
         count = len(
-            received_chunk_topics
+            received_chunks
         )
 
         if count != last_count:
 
             print(
-                f"[RECEIVE] "
-                f"{count}/{chunk_count} "
-                f"chunks"
+                f"[READ OLD] "
+                f"{count}/{chunk_count}"
             )
 
             last_count = count
-            last_change = time.time()
 
-        # 全チャンク取得
+        # 全チャンク＋meta
         if (
-            count >= chunk_count
-            and expected_meta in current_topics
+            count == chunk_count
+            and meta_topic in current
         ):
 
             print(
-                "[RECEIVE] "
-                "全チャンク受信完了"
+                "[READ OLD] "
+                "読み込み完了"
             )
 
             break
 
-        # 最大5分
         if (
-            time.time() - start
+            time.time() - start_time
             >= RETAIN_RECEIVE_TIMEOUT
         ):
 
             missing = (
                 expected_chunks
-                - received_chunk_topics
+                - received_chunks
             )
 
             raise TimeoutError(
-                "Retainデータ受信タイムアウト: "
+                "元MQTTデータの読み込み"
+                "タイムアウト: "
                 f"{len(missing)} chunks missing"
             )
 
         time.sleep(0.2)
 
     # --------------------------------------------------------
-    # 追加安定待ち
+    # 安定待ち
     # --------------------------------------------------------
-
-    print(
-        f"[RECEIVE] "
-        f"{RETAIN_SETTLE_TIME}秒安定待ち..."
-    )
 
     time.sleep(
         RETAIN_SETTLE_TIME
@@ -602,30 +596,31 @@ def receive_retained_file(file_info):
 
     with received_lock:
 
-        data = {}
+        meta = received_messages[
+            meta_topic
+        ]
 
-        for chunk_topic_name in (
-            expected_chunks
+        chunks = {}
+
+        for index in range(
+            chunk_count
         ):
 
-            if (
-                chunk_topic_name
-                not in received_messages
-            ):
+            topic = (
+                f"{old_topic}/chunk/"
+                f"{index:06d}"
+            )
+
+            if topic not in received_messages:
+
                 raise RuntimeError(
-                    "チャンクが不足しています: "
-                    f"{chunk_topic_name}"
+                    "チャンク不足: "
+                    + topic
                 )
 
-            data[
-                chunk_topic_name
-            ] = received_messages[
-                chunk_topic_name
-            ]
-
-        meta = received_messages.get(
-            expected_meta
-        )
+            chunks[index] = (
+                received_messages[topic]
+            )
 
     # --------------------------------------------------------
     # unsubscribe
@@ -642,63 +637,165 @@ def receive_retained_file(file_info):
         )
 
     except Exception:
+
         pass
 
-    return meta, data
+    return meta, chunks
 
 
 # ============================================================
-# MQTT Retain再Publish
+# 新しいID生成
 # ============================================================
 
-def refresh_file(file_info):
+def create_new_file_id():
 
-    file_name = file_info["file_name"]
+    return str(
+        uuid.uuid4()
+    )
+
+
+# ============================================================
+# 新しいMQTT topic
+# ============================================================
+
+def create_new_topic(
+    new_id
+):
+
+    return (
+        MQTT_FILE_BASE
+        + "/"
+        + new_id
+    )
+
+
+# ============================================================
+# 新しいMQTTデータ作成
+# ============================================================
+
+def create_new_mqtt_data(
+    old_file,
+    old_meta,
+    chunks,
+    new_id,
+    new_topic
+):
+
+    # --------------------------------------------------------
+    # metaを書き換える
+    # --------------------------------------------------------
+
+    new_meta = old_meta
+
+    try:
+
+        decoded = json.loads(
+            old_meta.decode("utf-8")
+        )
+
+        if isinstance(
+            decoded,
+            dict
+        ):
+
+            decoded["id"] = new_id
+
+            decoded["file_id"] = new_id
+
+            decoded["mqtt_topic"] = (
+                new_topic
+            )
+
+            decoded["rebuilt_from"] = (
+                str(old_file["id"])
+            )
+
+            decoded["rebuilt_at"] = (
+                time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ",
+                    time.gmtime()
+                )
+            )
+
+            new_meta = json.dumps(
+                decoded,
+                ensure_ascii=False,
+                separators=(",", ":")
+            ).encode("utf-8")
+
+    except Exception:
+
+        # JSONでない場合は
+        # 元metaをそのまま使用
+        new_meta = old_meta
+
+    return new_meta
+
+
+# ============================================================
+# 新しいMQTTへ作成
+# ============================================================
+
+def publish_new_file(
+    file_info,
+    meta,
+    chunks,
+    new_id,
+    new_topic
+):
 
     print("")
-    print("#" * 70)
     print(
-        f"[FILE] {file_name}"
-    )
-    print(
-        f"[FILE] size="
-        f"{int(file_info['file_size']):,} bytes"
-    )
-    print(
-        f"[FILE] chunks="
-        f"{file_info['chunk_count']}"
-    )
-    print("#" * 70)
-
-    # --------------------------------------------------------
-    # 既存Retainを取得
-    # --------------------------------------------------------
-
-    meta, chunks = (
-        receive_retained_file(
-            file_info
-        )
+        "=" * 70
     )
 
-    topic = file_info["mqtt_topic"]
-
-    # --------------------------------------------------------
-    # metaを再Publish
-    # --------------------------------------------------------
+    print(
+        "[CREATE NEW]"
+    )
 
     print(
-        "[PUBLISH] metadata"
+        "old ID:",
+        file_info["id"]
+    )
+
+    print(
+        "new ID:",
+        new_id
+    )
+
+    print(
+        "new topic:",
+        new_topic
+    )
+
+    print(
+        "=" * 70
+    )
+
+    # --------------------------------------------------------
+    # meta
+    # --------------------------------------------------------
+
+    new_meta = create_new_mqtt_data(
+        file_info,
+        meta,
+        chunks,
+        new_id,
+        new_topic
     )
 
     publish_with_retry(
-        topic=f"{topic}/meta",
-        payload=meta,
+        topic=(
+            new_topic
+            + "/meta"
+        ),
+        payload=new_meta,
         retain=True,
         qos=0
     )
 
     # --------------------------------------------------------
-    # chunkを再Publish
+    # chunks
     # --------------------------------------------------------
 
     chunk_count = int(
@@ -709,53 +806,286 @@ def refresh_file(file_info):
         chunk_count
     ):
 
-        chunk_topic = (
-            f"{topic}/chunk/"
+        new_chunk_topic = (
+            f"{new_topic}/chunk/"
             f"{index:06d}"
         )
 
-        payload = chunks[
-            chunk_topic
-        ]
+        payload = chunks[index]
 
         print(
-            f"[PUBLISH] "
-            f"{index + 1}/{chunk_count} "
-            f"{file_name}"
+            f"[CREATE NEW] "
+            f"chunk "
+            f"{index + 1}/{chunk_count}"
         )
 
         publish_with_retry(
-            topic=chunk_topic,
+            topic=new_chunk_topic,
             payload=payload,
             retain=True,
             qos=0
         )
 
-    print("")
     print(
-        f"[FILE] 再保存完了: "
-        f"{file_name}"
+        "[CREATE NEW] "
+        "MQTT作成完了"
     )
 
 
 # ============================================================
-# DB更新
+# 新しいDBレコード作成
 # ============================================================
 
-def update_refresh_time(
-    file_id
+def insert_new_db_record(
+    old_file,
+    new_id,
+    new_topic
 ):
 
     sql = """
-        ALTER TABLE public.shared_files
-        ADD COLUMN IF NOT EXISTS
-        mqtt_last_refreshed_at
-        timestamptz
+        INSERT INTO public.shared_files (
+            id,
+            user_id,
+            file_name,
+            file_size,
+            mime_type,
+            chunk_count,
+            chunk_size,
+            mqtt_topic,
+            created_at
+        )
+        VALUES (
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            NOW()
+        )
     """
 
-    update_sql = """
-        UPDATE public.shared_files
-        SET mqtt_last_refreshed_at = NOW()
+    with psycopg.connect(
+        DATABASE_URL
+    ) as conn:
+
+        with conn.cursor() as cur:
+
+            cur.execute(
+                sql,
+                (
+                    new_id,
+                    old_file["user_id"],
+                    old_file["file_name"],
+                    old_file["file_size"],
+                    old_file["mime_type"],
+                    old_file["chunk_count"],
+                    old_file["chunk_size"],
+                    new_topic
+                )
+            )
+
+        conn.commit()
+
+    print(
+        "[DB] 新しいレコード作成完了:",
+        new_id
+    )
+
+
+# ============================================================
+# 新MQTTデータ存在確認
+# ============================================================
+
+def verify_new_mqtt_data(
+    file_info,
+    new_id,
+    new_topic
+):
+
+    print(
+        "[VERIFY] "
+        "新しいMQTTデータを確認します"
+    )
+
+    with received_lock:
+
+        received_messages.clear()
+
+    ensure_mqtt_connection()
+
+    chunk_count = int(
+        file_info["chunk_count"]
+    )
+
+    chunk_topic = (
+        new_topic
+        + "/chunk/+"
+    )
+
+    meta_topic = (
+        new_topic
+        + "/meta"
+    )
+
+    mqtt_client.subscribe(
+        chunk_topic,
+        qos=0
+    )
+
+    mqtt_client.subscribe(
+        meta_topic,
+        qos=0
+    )
+
+    expected_chunks = set()
+
+    for index in range(
+        chunk_count
+    ):
+
+        expected_chunks.add(
+            f"{new_topic}/chunk/"
+            f"{index:06d}"
+        )
+
+    start_time = time.time()
+
+    while True:
+
+        with received_lock:
+
+            current = set(
+                received_messages.keys()
+            )
+
+        received_chunks = (
+            current
+            & expected_chunks
+        )
+
+        if (
+            len(received_chunks)
+            == chunk_count
+            and meta_topic in current
+        ):
+
+            print(
+                "[VERIFY] "
+                "新MQTTデータ確認OK"
+            )
+
+            break
+
+        if (
+            time.time() - start_time
+            >= RETAIN_RECEIVE_TIMEOUT
+        ):
+
+            raise TimeoutError(
+                "新MQTTデータ確認タイムアウト"
+            )
+
+        time.sleep(0.2)
+
+    try:
+
+        mqtt_client.unsubscribe(
+            chunk_topic
+        )
+
+        mqtt_client.unsubscribe(
+            meta_topic
+        )
+
+    except Exception:
+
+        pass
+
+    return True
+
+
+# ============================================================
+# 古いMQTT Retain削除
+# ============================================================
+
+def delete_old_mqtt(
+    file_info
+):
+
+    old_topic = file_info["mqtt_topic"]
+
+    chunk_count = int(
+        file_info["chunk_count"]
+    )
+
+    print("")
+    print(
+        "[DELETE OLD MQTT]"
+    )
+
+    print(
+        "topic:",
+        old_topic
+    )
+
+    # --------------------------------------------------------
+    # meta削除
+    # --------------------------------------------------------
+
+    publish_with_retry(
+        topic=(
+            old_topic
+            + "/meta"
+        ),
+        payload=b"",
+        retain=True,
+        qos=0
+    )
+
+    # --------------------------------------------------------
+    # chunk削除
+    # --------------------------------------------------------
+
+    for index in range(
+        chunk_count
+    ):
+
+        old_chunk_topic = (
+            f"{old_topic}/chunk/"
+            f"{index:06d}"
+        )
+
+        print(
+            f"[DELETE OLD MQTT] "
+            f"{index + 1}/{chunk_count}"
+        )
+
+        publish_with_retry(
+            topic=old_chunk_topic,
+            payload=b"",
+            retain=True,
+            qos=0
+        )
+
+    print(
+        "[DELETE OLD MQTT] "
+        "削除完了"
+    )
+
+
+# ============================================================
+# 古いDBレコード削除
+# ============================================================
+
+def delete_old_db_record(
+    old_id
+):
+
+    sql = """
+        DELETE FROM public.shared_files
         WHERE id = %s
     """
 
@@ -765,14 +1095,215 @@ def update_refresh_time(
 
         with conn.cursor() as cur:
 
-            cur.execute(sql)
-
             cur.execute(
-                update_sql,
-                (file_id,)
+                sql,
+                (old_id,)
             )
 
+            deleted = cur.rowcount
+
         conn.commit()
+
+    print(
+        "[DB] 古いレコード削除:",
+        old_id,
+        "rows=",
+        deleted
+    )
+
+
+# ============================================================
+# 1ファイル再作成
+# ============================================================
+
+def rebuild_file(
+    file_info
+):
+
+    old_id = str(
+        file_info["id"]
+    )
+
+    # --------------------------------------------------------
+    # 新しいID
+    # --------------------------------------------------------
+
+    new_id = create_new_file_id()
+
+    new_topic = create_new_topic(
+        new_id
+    )
+
+    print("")
+    print(
+        "########################################"
+    )
+
+    print(
+        "FILE:",
+        file_info["file_name"]
+    )
+
+    print(
+        "OLD ID:",
+        old_id
+    )
+
+    print(
+        "NEW ID:",
+        new_id
+    )
+
+    print(
+        "########################################"
+    )
+
+    # ========================================================
+    # 1. 元データ読み込み
+    # ========================================================
+
+    old_meta, chunks = (
+        read_old_mqtt_data(
+            file_info
+        )
+    )
+
+    # ========================================================
+    # 2. 新IDでMQTT作成
+    # ========================================================
+
+    publish_new_file(
+        file_info,
+        old_meta,
+        chunks,
+        new_id,
+        new_topic
+    )
+
+    # ========================================================
+    # 3. 新MQTT確認
+    # ========================================================
+
+    verify_new_mqtt_data(
+        file_info,
+        new_id,
+        new_topic
+    )
+
+    # ========================================================
+    # 4. 新DBレコード作成
+    # ========================================================
+
+    try:
+
+        insert_new_db_record(
+            file_info,
+            new_id,
+            new_topic
+        )
+
+    except Exception as e:
+
+        print(
+            "[ERROR] "
+            "新DBレコード作成失敗"
+        )
+
+        print(e)
+
+        # ----------------------------------------------------
+        # 新MQTTを削除
+        # ----------------------------------------------------
+
+        print(
+            "[ROLLBACK] "
+            "新MQTTを削除します"
+        )
+
+        temp_file = dict(
+            file_info
+        )
+
+        temp_file["mqtt_topic"] = (
+            new_topic
+        )
+
+        try:
+
+            delete_old_mqtt(
+                temp_file
+            )
+
+        except Exception as cleanup_error:
+
+            print(
+                "[ROLLBACK] "
+                "新MQTT削除失敗:",
+                cleanup_error
+            )
+
+        raise
+
+    # ========================================================
+    # 5. ここまで成功したので
+    #    初めて旧データを削除
+    # ========================================================
+
+    print("")
+    print(
+        "[OLD DATA] "
+        "新データ作成確認済み"
+    )
+
+    print(
+        "[OLD DATA] "
+        "これから旧データを削除します"
+    )
+
+    # --------------------------------------------------------
+    # 旧MQTT削除
+    # --------------------------------------------------------
+
+    delete_old_mqtt(
+        file_info
+    )
+
+    # --------------------------------------------------------
+    # 旧DB削除
+    # --------------------------------------------------------
+
+    delete_old_db_record(
+        old_id
+    )
+
+    print("")
+    print(
+        "========================================"
+    )
+
+    print(
+        "[SUCCESS] "
+        "ファイル再作成完了"
+    )
+
+    print(
+        "file:",
+        file_info["file_name"]
+    )
+
+    print(
+        "old ID:",
+        old_id
+    )
+
+    print(
+        "new ID:",
+        new_id
+    )
+
+    print(
+        "========================================"
+    )
 
 
 # ============================================================
@@ -782,58 +1313,75 @@ def update_refresh_time(
 def main():
 
     print("")
-    print("=" * 70)
     print(
-        "ChanPro Shared Files MQTT Refresh"
-    )
-    print("=" * 70)
-
-    print(
-        f"MQTT broker : "
-        f"{MQTT_HOST}:{MQTT_PORT}"
+        "=" * 70
     )
 
     print(
-        f"Publish timeout : "
-        f"{MQTT_PUBLISH_TIMEOUT}秒"
+        "ChanPro Shared Files"
     )
 
     print(
-        f"Publish retry : "
-        f"{PUBLISH_RETRY_COUNT}回"
+        "MQTT ID REBUILD"
     )
 
     print(
-        f"Receive timeout : "
-        f"{RETAIN_RECEIVE_TIMEOUT}秒"
+        "=" * 70
     )
 
-    print("=" * 70)
-    print("")
+    print(
+        "Publish timeout:",
+        MQTT_PUBLISH_TIMEOUT,
+        "seconds"
+    )
+
+    print(
+        "Receive timeout:",
+        RETAIN_RECEIVE_TIMEOUT,
+        "seconds"
+    )
+
+    print(
+        "Retry:",
+        PUBLISH_RETRY_COUNT
+    )
+
+    print(
+        "=" * 70
+    )
+
+    # --------------------------------------------------------
+    # DB
+    # --------------------------------------------------------
 
     files = get_shared_files()
 
     if not files:
 
         print(
-            "[MAIN] 対象ファイルはありません"
+            "対象ファイルがありません"
         )
 
         return
 
+    print(
+        f"{len(files)}件のファイルを"
+        "処理します"
+    )
+
     # --------------------------------------------------------
-    # MQTT接続
+    # MQTT
     # --------------------------------------------------------
 
     connect_mqtt()
 
-    success_count = 0
-    failure_count = 0
+    success = 0
+    failed = 0
 
     errors = []
 
     # --------------------------------------------------------
-    # ファイル処理
+    # 全ファイル
     # --------------------------------------------------------
 
     for index, file_info in enumerate(
@@ -843,53 +1391,39 @@ def main():
 
         print("")
         print(
-            f"[MAIN] "
-            f"FILE {index}/{len(files)}"
+            f"========== "
+            f"{index}/{len(files)} "
+            f"=========="
         )
 
         try:
 
-            refresh_file(
+            rebuild_file(
                 file_info
             )
 
-            try:
-
-                update_refresh_time(
-                    file_info["id"]
-                )
-
-            except Exception as e:
-
-                print(
-                    "[DB] "
-                    "refresh time更新失敗: "
-                    f"{e}"
-                )
-
-            success_count += 1
+            success += 1
 
         except Exception as e:
 
-            failure_count += 1
+            failed += 1
 
-            error_message = (
+            message = (
                 f"{file_info['file_name']}: "
                 f"{e}"
             )
 
             errors.append(
-                error_message
+                message
             )
 
             print(
-                "[ERROR] "
-                f"{error_message}"
+                "[FAILED]",
+                message
             )
 
             # ------------------------------------------------
-            # 1ファイル失敗しても
-            # 次のファイルへ進む
+            # 失敗しても次のファイルへ
             # ------------------------------------------------
 
             continue
@@ -905,6 +1439,7 @@ def main():
             mqtt_client.loop_stop()
 
         except Exception:
+
             pass
 
         try:
@@ -912,6 +1447,7 @@ def main():
             mqtt_client.disconnect()
 
         except Exception:
+
             pass
 
     # --------------------------------------------------------
@@ -919,58 +1455,54 @@ def main():
     # --------------------------------------------------------
 
     print("")
-    print("=" * 70)
-    print("処理結果")
-    print("=" * 70)
-
     print(
-        f"成功: {success_count}"
+        "=" * 70
     )
 
     print(
-        f"失敗: {failure_count}"
+        "処理完了"
     )
 
     print(
-        f"全体: {len(files)}"
+        f"成功: {success}"
+    )
+
+    print(
+        f"失敗: {failed}"
+    )
+
+    print(
+        f"合計: {len(files)}"
     )
 
     if errors:
 
         print("")
         print(
-            "失敗したファイル:"
+            "失敗一覧:"
         )
 
         for error in errors:
 
             print(
-                f" - {error}"
+                " -",
+                error
             )
 
-    print("=" * 70)
+    print(
+        "=" * 70
+    )
 
-    # --------------------------------------------------------
-    # 失敗があった場合
-    # GitHub Actionsを失敗扱い
-    # --------------------------------------------------------
-
-    if failure_count > 0:
+    if failed > 0:
 
         raise RuntimeError(
-            f"{failure_count}件の"
-            "ファイルで処理に失敗しました"
+            f"{failed}件の"
+            "ファイルで失敗しました"
         )
-
-    print("")
-    print(
-        "すべてのMQTT Retain再保存が"
-        "正常に完了しました。"
-    )
 
 
 # ============================================================
-# 実行
+# START
 # ============================================================
 
 if __name__ == "__main__":
@@ -982,28 +1514,16 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
 
         print(
-            "処理を中断しました。"
+            "中断しました"
         )
 
         sys.exit(130)
 
     except Exception as e:
 
-        print("")
         print(
-            "================================"
-        )
-
-        print(
-            "ERROR:"
-        )
-
-        print(
-            str(e)
-        )
-
-        print(
-            "================================"
+            "ERROR:",
+            e
         )
 
         sys.exit(1)
